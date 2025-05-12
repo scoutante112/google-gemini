@@ -3,6 +3,7 @@ const { Client4 } = require('@mattermost/client');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const WebSocket = require('ws');
 const introducedChannels = new Set();
+const { searchDrive, getDocContent, getFolderName, DEFAULT_FOLDER_ID, summarizeDocument } = require('./drive-search');
 
 // Mattermost konfiguration
 const MM_BOT_TOKEN = process.env.MATTERMOST_BOT_TOKEN;
@@ -36,6 +37,10 @@ const model = genAI.getGenerativeModel({
   - Stadgar och regelverk
   - Kommunikation med medlemmar
   - Projekthantering och uppföljning
+  
+  Du kan också hjälpa till att:
+  - Söka i Google Drive genom att användaren skriver "sök efter [sökord]" 
+  - Sammanfatta dokument genom att användaren skriver "sammanfatta dokument [dokument-URL eller namn]"
   
   Var professionell, koncis och fokuserad på att hjälpa styrelsen att arbeta effektivt.
   Föreslå konkreta lösningar och tillvägagångssätt när det är lämpligt.
@@ -189,15 +194,33 @@ async function handleMessage(data) {
           if (!introducedChannels.has(post.channel_id)) {
             introducedChannels.add(post.channel_id);
             
-            // Skicka välkomstmeddelande först
-            await client.createPost({
-              channel_id: post.channel_id,
-              message: 'Hej styrelsen! Jag är er AI-assistent för styrelsearbetet. Jag kan hjälpa till med att generera mallar, svara på frågor om styrelsearbete, och assistera med planering. Skriv `/hjälp` för att se tillgängliga kommandon.',
-            });
-            
-            // Om det bara var en hälsning, avsluta här
-            if (cleanMessage.match(/^(hej|hallå|tjena|hello|hi)/i)) {
-              return;
+            try {
+              // Get the user's information to personalize the greeting
+              const user = await client.getUser(post.user_id);
+              const userName = user.first_name || user.username; // Use first name if available, otherwise username
+              
+              // Send personalized welcome message
+              await client.createPost({
+                channel_id: post.channel_id,
+                message: `Hej ${userName}! Jag är er AI-assistent för styrelsearbetet. Jag kan hjälpa till med att generera mallar, svara på frågor om styrelsearbete, och assistera med planering. Skriv \`/hjälp\` för att se tillgängliga kommandon.`,
+              });
+              
+              // If it was just a greeting, end here
+              if (cleanMessage.match(/^(hej|hallå|tjena|hello|hi)/i)) {
+                return;
+              }
+            } catch (error) {
+              console.error('Kunde inte hämta användarinformation:', error);
+              
+              // Fallback to generic greeting if user info can't be retrieved
+              await client.createPost({
+                channel_id: post.channel_id,
+                message: 'Hej! Jag är er AI-assistent för styrelsearbetet. Jag kan hjälpa till med att generera mallar, svara på frågor om styrelsearbete, och assistera med planering. Skriv `/hjälp` för att se tillgängliga kommandon.',
+              });
+              
+              if (cleanMessage.match(/^(hej|hallå|tjena|hello|hi)/i)) {
+                return;
+              }
             }
           }
           
@@ -209,6 +232,205 @@ async function handleMessage(data) {
               await client.createPost({
                 channel_id: post.channel_id,
                 message: boardCommands[command],
+                ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+              });
+              return;
+            }
+          }
+          
+          // Check for natural language search queries
+          if (cleanMessage.toLowerCase().startsWith('sök efter') || 
+              cleanMessage.toLowerCase().startsWith('leta efter') || 
+              cleanMessage.toLowerCase().startsWith('hitta') ||
+              cleanMessage.toLowerCase().match(/^(sök|leta|hitta)\s/i)) {
+            
+            console.log('Naturlig språksökning i Google Drive detekterad');
+            
+            // Extract the search query
+            let searchQuery = '';
+            if (cleanMessage.toLowerCase().startsWith('sök efter')) {
+              searchQuery = cleanMessage.substring('sök efter'.length).trim();
+            } else if (cleanMessage.toLowerCase().startsWith('leta efter')) {
+              searchQuery = cleanMessage.substring('leta efter'.length).trim();
+            } else if (cleanMessage.toLowerCase().startsWith('hitta')) {
+              searchQuery = cleanMessage.substring('hitta'.length).trim();
+            } else {
+              // Handle "sök X", "leta X", "hitta X" patterns
+              searchQuery = cleanMessage.substring(cleanMessage.indexOf(' ')).trim();
+            }
+            
+            // We'll always use the default folder unless explicitly overridden
+            let folderId = DEFAULT_FOLDER_ID;
+            
+            try {
+              // Get the folder name for better user feedback
+              const folderName = await getFolderName(folderId);
+              
+              // Send a message that we're searching
+              await client.createPost({
+                channel_id: post.channel_id,
+                message: `Söker efter "${searchQuery}" i styrelsemappen "${folderName}"...`,
+                ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+              });
+              
+              const results = await searchDrive(searchQuery);
+              
+              if (results.length === 0) {
+                await client.createPost({
+                  channel_id: post.channel_id,
+                  message: `Inga dokument hittades för sökningen "${searchQuery}" i styrelsemappen.`,
+                  ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+                });
+                return;
+              }
+              
+              // Format the results
+              let responseMessage = `### Sökresultat för "${searchQuery}" i styrelsemappen\n\n`;
+              
+              for (let i = 0; i < Math.min(results.length, 10); i++) {
+                const file = results[i];
+                let fileInfo = `${i+1}. [${file.name}](${file.webViewLink})`;
+                
+                // Add description if available
+                if (file.description) {
+                  fileInfo += ` - ${file.description}`;
+                }
+                
+                responseMessage += fileInfo + '\n';
+              }
+              
+              if (results.length > 10) {
+                responseMessage += `\n_Visar 10 av ${results.length} resultat._`;
+              }
+              
+              await client.createPost({
+                channel_id: post.channel_id,
+                message: responseMessage,
+                ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+              });
+              return; // Skip Gemini processing
+            } catch (error) {
+              console.error('Fel vid sökning i Google Drive:', error);
+              await client.createPost({
+                channel_id: post.channel_id,
+                message: 'Ett fel uppstod vid sökning i Google Drive. Kontrollera loggarna för mer information.',
+                ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+              });
+              return; // Skip Gemini processing
+            }
+          }
+          
+          // Check for document summarization requests
+          if (cleanMessage.toLowerCase().startsWith('sammanfatta dokument') || 
+              cleanMessage.toLowerCase().includes('sammanfatta dokumentet') ||
+              cleanMessage.toLowerCase().match(/sammanfatta\s+https:\/\/docs\.google\.com\/document\/d\//i)) {
+            
+            console.log('Dokumentsammanfattning begärd');
+            
+            // Extract the document ID
+            let docId = null;
+            
+            // Check if the message contains a Google Docs URL
+            const docUrlMatch = cleanMessage.match(/https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+)/);
+            if (docUrlMatch && docUrlMatch[1]) {
+              docId = docUrlMatch[1];
+            } else {
+              // Try to extract the document ID or name from the message
+              const docQuery = cleanMessage.replace(/sammanfatta dokument(et)?/i, '').trim();
+              
+              if (docQuery) {
+                // If it looks like a document ID (long string of characters)
+                if (docQuery.length > 20 && !docQuery.includes(' ')) {
+                  docId = docQuery;
+                } else {
+                  // Search for the document by name
+                  try {
+                    await client.createPost({
+                      channel_id: post.channel_id,
+                      message: `Söker efter dokument med namn "${docQuery}"...`,
+                      ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+                    });
+                    
+                    const results = await searchDrive(docQuery);
+                    
+                    if (results.length === 0) {
+                      await client.createPost({
+                        channel_id: post.channel_id,
+                        message: `Hittade inget dokument med namn som matchar "${docQuery}".`,
+                        ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+                      });
+                      return;
+                    }
+                    
+                    // Use the first Google Doc result
+                    for (const file of results) {
+                      if (file.mimeType === 'application/vnd.google-apps.document') {
+                        docId = file.id;
+                        break;
+                      }
+                    }
+                    
+                    if (!docId) {
+                      await client.createPost({
+                        channel_id: post.channel_id,
+                        message: `Hittade inga Google Docs-dokument som matchar "${docQuery}".`,
+                        ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+                      });
+                      return;
+                    }
+                  } catch (error) {
+                    console.error('Fel vid sökning efter dokument:', error);
+                    await client.createPost({
+                      channel_id: post.channel_id,
+                      message: 'Ett fel uppstod vid sökning efter dokumentet. Kontrollera loggarna för mer information.',
+                      ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+                    });
+                    return;
+                  }
+                }
+              } else {
+                await client.createPost({
+                  channel_id: post.channel_id,
+                  message: 'Användning: "sammanfatta dokument [dokument-ID eller URL eller namn]"',
+                  ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+                });
+                return;
+              }
+            }
+            
+            // Now we have a document ID, let's summarize it
+            try {
+              await client.createPost({
+                channel_id: post.channel_id,
+                message: 'Hämtar och sammanfattar dokumentet...',
+                ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+              });
+              
+              const result = await summarizeDocument(docId, genAI);
+              
+              if (!result.success) {
+                await client.createPost({
+                  channel_id: post.channel_id,
+                  message: `Kunde inte sammanfatta dokumentet: ${result.error || 'Okänt fel'}`,
+                  ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+                });
+                return;
+              }
+              
+              // Send the summary
+              const responseMessage = `## Sammanfattning av "${result.fileName}"\n\n${result.summary}`;
+              
+              await client.createPost({
+                channel_id: post.channel_id,
+                message: responseMessage,
+                ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
+              });
+              return;
+            } catch (error) {
+              console.error('Fel vid sammanfattning av dokument:', error);
+              await client.createPost({
+                channel_id: post.channel_id,
+                message: 'Ett fel uppstod vid sammanfattning av dokumentet. Kontrollera loggarna för mer information.',
                 ...(post.root_id ? { root_id: post.root_id } : { root_id: post.id }),
               });
               return;
@@ -308,9 +530,41 @@ try {
   console.log('Gemini-bot för Mattermost startar...');
   
   // Testa Mattermost-anslutning
+  async function setOnlineStatus() {
+    try {
+      // Get the bot's user ID
+      const me = await client.getMe();
+      const botId = me.id;
+      
+      // Use the updateStatus method instead of updateUserStatus
+      await client.updateStatus({
+        user_id: botId,
+        status: 'online'
+      });
+      
+      console.log('Bot status set to online');
+    } catch (error) {
+      console.error('Failed to update bot status:', error);
+    }
+  }
+
+  // Call this function periodically
+  function maintainOnlineStatus() {
+    setOnlineStatus();
+    // Update status every 5 minutes
+    setTimeout(maintainOnlineStatus, 5 * 60 * 1000);
+  }
+
+  // Start the status updates when the bot connects
   client.getMe()
     .then(me => {
       console.log('Ansluten till Mattermost som:', me.username);
+      
+      // Set initial online status
+      setOnlineStatus();
+      
+      // Start periodic status updates
+      maintainOnlineStatus();
       
       // Anslut WebSocket efter lyckad Mattermost-anslutning
       connectWebSocket();
