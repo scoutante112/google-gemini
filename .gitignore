@@ -4,7 +4,8 @@
 .env
 .env.local
 google-credentials.json 
-
+config.json
+introduced_channels.json
 
 # Node.js
 /node_modules
