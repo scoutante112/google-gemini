@@ -1,2 +1,11 @@
-# .gitignore content
+# .gitignore
+
+# Miljöinställningar och konfigurationer
 .env
+.env.local
+
+# Node.js
+/node_modules
+
+# Paketkonfiguration
+package-lock.json

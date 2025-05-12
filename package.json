@@ -1,0 +1,20 @@
+{
+  "name": "mattermost-gemini-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@google-ai/generativelanguage": "^3.1.0",
+    "@google/generative-ai": "^0.24.1",
+    "@mattermost/client": "^10.7.0",
+    "dotenv": "^16.5.0",
+    "google-auth-library": "^10.0.0-rc.2",
+    "ws": "^8.18.2"
+  }
+}
